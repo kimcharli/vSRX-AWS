@@ -1,0 +1,988 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Conditions:
+  AuthorizeAnotherAccount:
+    Fn::Not:
+    - Fn::Equals:
+      - {Ref: AccountId}
+      - ''
+  EnableTerm:
+    Fn::Equals:
+    - {Ref: TerminationProtection}
+    - 'Yes'
+  SendData:
+    Fn::Equals:
+    - {Ref: SendAnonymousData}
+    - 'Yes'
+Description: '(SO0001j) - Transit VPC: This template creates a dedicated transit VPC
+  with Juniper VSRX for routing traffic. ***NOTE*** You must first subscribe to the
+  appropriate Juniper VSRX marketplace BYOL or License Included AMI from the AWS Marketplace
+  before you launch this template. Version 3'
+Mappings:
+  Function:
+    Configurator: {CodeLocation: juniper-transit-vpc/transit-vpc-push-juniper-config.zip,
+      Description: 'Transit VPC: This function is invoked when a generic VPN configuration
+        is placed in an S3 bucket - it converts the generic information into Junos
+        OS specific commands and pushes the config to transit VPC routers.', MemorySize: '128',
+      Name: juniper-configurator, Runtime: python2.7, Timeout: '300'}
+    FindReplace: {Deliminator: '|', S3BucketID: '%BUCKET_NAME%', S3PrefixID: '%PREFIX%'}
+    Poller: {CodeLocation: juniper-transit-vpc/transit-vpc-poller.py, Description: 'Transit
+        VPC: Poller function responsible for identifying specifically tagged VGWs
+        and creating VPN connections to transit VPC.', MemorySize: '128', Name: vgw-poller,
+      Runtime: python2.7, Timeout: '120'}
+    vSRX: {PasswordLength: '15', PrivateKey: prikey.pem, PublicKey: pubkey.pem, UserName: root}
+  JunipervSRXAMI:
+    ap-northeast-1: {BYOL: ami-d584abb2, LicenseIncluded: ami-1c83ac7b}
+    ap-northeast-2: {BYOL: ami-1c00d272, LicenseIncluded: ami-1206d47c}
+    ap-south-1: {BYOL: ami-88cfbce7, LicenseIncluded: ami-2bcdbe44}
+    ap-southeast-1: {BYOL: ami-2a219849, LicenseIncluded: ami-d02a93b3}
+    ap-southeast-2: {BYOL: ami-bdc4cdde, LicenseIncluded: ami-59c2cb3a}
+    ca-central-1: {BYOL: ami-3dcc7059, LicenseIncluded: ami-4ccc7028}
+    eu-central-1: {BYOL: ami-6bbe6304, LicenseIncluded: ami-51b8653e}
+    eu-west-1: {BYOL: ami-12a9ad74, LicenseIncluded: ami-36a8ac50}
+    eu-west-2: {BYOL: ami-dbc5d1bf, LicenseIncluded: ami-52c6d236}
+    sa-east-1: {BYOL: ami-122a477e, LicenseIncluded: ami-f724499b}
+    us-east-1: {BYOL: ami-c21989d4, LicenseIncluded: ami-4a1b8b5c}
+    us-east-2: {BYOL: ami-dc98bcb9, LicenseIncluded: ami-809abee5}
+    us-west-1: {BYOL: ami-67604407, LicenseIncluded: ami-da6642ba}
+    us-west-2: {BYOL: ami-d98518b9, LicenseIncluded: ami-408b1620}
+  vSRXInstance:
+    C4.Xlarge: {Bandwidth: '500000', Type: c4.xlarge}
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label: {default: Juniper VSRX Configuration}
+      Parameters: [VSRXType, KeyName, LicenseModel, TerminationProtection]
+    - Label: {default: AWS Service Configuration}
+      Parameters: [S3Prefix, AccountId, LambdaRegion]
+    - Label: {default: Network Configuration}
+      Parameters: [VpcCidr, PubSubnet11, PubSubnet12, PubSubnet21, PubSubnet22, BgpAsn,
+        SpokeTag, SpokeTagValue, PreferredPathTag]
+    - Label: {default: Anonymous Metrics Request}
+      Parameters: [SendAnonymousData]
+    ParameterLabels:
+      AccountId: {default: Additional AWS Account ID (Optional)}
+      BgpAsn: {default: Transit VPC BGP ASN}
+      KeyName: {default: SSH Key to access VSRX}
+      LambdaRegion: {default: Lambda region}
+      LicenseModel: {default: License Model}
+      PreferredPathTag: {default: Preferred VPN Endpoint Tag Name}
+      PubSubnet11: {default: vSRX1- 1st Subnet Network}
+      PubSubnet12: {default: vSRX1- 2nd Subnet Network}
+      PubSubnet21: {default: vSRX2- 1st Subnet Network}
+      PubSubnet22: {default: vSRX2- 2nd Subnet Network}
+      S3Prefix: {default: Prefix for S3 Objects}
+      SpokeTag: {default: Spoke VPC Tag Name}
+      SpokeTagValue: {default: Spoke VPC Tag Value}
+      TerminationProtection: {default: Enable Termination Protection}
+      VSRXType: {default: VSRX Throughput Requirements}
+      VpcCidr: {default: Transit VPC CIDR Block}
+Outputs:
+  BucketPrefix:
+    Description: S3 prefix for storing VPN configuration information.
+    Value: {Ref: S3Prefix}
+  ConfigS3Bucket:
+    Description: S3 bucket for storing VPN configuration information.
+    Value: {Ref: VPNConfigS3Bucket}
+  PreferredPathTagName:
+    Description: Tag used to identify the spoke VPC preferred path.
+    Value: {Ref: PreferredPathTag}
+  SpokeVPCTag:
+    Description: Tag used to identify spoke VPCs.
+    Value: {Ref: SpokeTag}
+  SpokeVPCTagValue:
+    Description: Tag valued used to idenfity spoke VPCs.
+    Value: {Ref: SpokeTagValue}
+  UUID:
+    Description: Newly created random UUID.
+    Value:
+      Fn::GetAtt: [CreateUniqueID, UUID]
+  VSRX1:
+    Description: IP Address for VSRX1
+    Value:
+      Fn::GetAtt: [VpcvSRX1, PublicIp]
+  VSRX2:
+    Description: IP Address for VSRX2
+    Value:
+      Fn::GetAtt: [VpcvSRX2, PublicIp]
+Parameters:
+  AccountId: {Default: '', Description: Another AWS Account ID to authorize access
+      to VPN Config S3 bucket (for example bucket and KMS key policies)., Type: String}
+  BgpAsn: {Default: '64512', Description: BGP ASN to use for Transit VPC., Type: String}
+  KeyName: {Default: Lab, Description: Name of an existing EC2 KeyPair to enable SSH
+      access to the instances, Type: 'AWS::EC2::KeyPair::KeyName'}
+  LambdaRegion:
+    AllowedValues: [us-east-1, us-east-2, us-west-2, us-west-1, eu-west-1, eu-central-1,
+      ap-south-1, ap-southeast-1, ap-southeast-2, ap-northeast-1, ap-northeast-2]
+    Default: us-east-1
+    Description: Choose a region to where Lambda code runs.
+    Type: String
+  LicenseModel:
+    AllowedValues: [LicenseIncluded, BYOL]
+    Default: LicenseIncluded
+    Description: Choose between BYOL (Bring Your Own License) and License Included
+      license models. Remember to first subscribe the the appropriate Marketplace
+      AMI!
+    Type: String
+  PreferredPathTag: {Default: 'transitvpc:preferred-path', Description: Tag to use
+      to configure a preferred VSRX VPN endpoint to control traffic flow through the
+      Transit VPC VSRX (e.g. when integrating with CPE)., Type: String}
+  PubSubnet11: {Default: 200.0.254.0/24, Description: Address range for Transit VPC
+      subnet to be created in AZ1., Type: String}
+  PubSubnet12: {Default: 200.0.1.0/24, Description: Address range for Transit VPC
+      subnet to be created in AZ1., Type: String}
+  PubSubnet21: {Default: 200.0.253.0/24, Description: Address range for Transit VPC
+      subnet to be created in AZ2., Type: String}
+  PubSubnet22: {Default: 200.0.2.0/24, Description: Address range for Transit VPC
+      subnet to be created in AZ2., Type: String}
+  S3Prefix: {Default: vpnconfigs/, Description: S3 prefix to append before S3 key
+      names., Type: String}
+  SendAnonymousData:
+    AllowedValues: ['Yes', 'No']
+    Default: 'No'
+    Description: Choose to send anonymous data to AWS.
+    Type: String
+  SpokeTag: {Default: 'transitvpc:spoke', Description: Tag to use to identify spoke
+      VPCs to connect to Transit VPC., Type: String}
+  SpokeTagValue: {Default: 'true', Description: Tag value to use to identify spoke
+      VPCs to connect to Transit VPC., Type: String}
+  TerminationProtection:
+    AllowedValues: ['Yes', 'No']
+    Default: 'Yes'
+    Description: Enable termination protection on the VSRX EC2 instances to avoid
+      accidential VSRX termination?
+    Type: String
+  VSRXType:
+    AllowedValues: [C4.Xlarge]
+    Default: C4.Xlarge
+    Description: Maximum network througput required for VSRX instances.
+    Type: String
+  VpcCidr: {Default: 200.0.0.0/16, Description: CIDR block for Transit VPC., Type: String}
+Resources:
+  AssociateEIP11:
+    Properties:
+      AllocationId:
+        Fn::GetAtt: [vSRXEip11, AllocationId]
+      NetworkInterfaceId: {Ref: vSRXInterface11}
+    Type: AWS::EC2::EIPAssociation
+  AssociateEIP12:
+    Properties:
+      AllocationId:
+        Fn::GetAtt: [vSRXEip12, AllocationId]
+      NetworkInterfaceId: {Ref: vSRXInterface12}
+    Type: AWS::EC2::EIPAssociation
+  AssociateEIP21:
+    Properties:
+      AllocationId:
+        Fn::GetAtt: [vSRXEip21, AllocationId]
+      NetworkInterfaceId: {Ref: vSRXInterface21}
+    Type: AWS::EC2::EIPAssociation
+  AssociateEIP22:
+    Properties:
+      AllocationId:
+        Fn::GetAtt: [vSRXEip22, AllocationId]
+      NetworkInterfaceId: {Ref: vSRXInterface22}
+    Type: AWS::EC2::EIPAssociation
+  CreateRandomPassword:
+    Properties:
+      CreateRandomPassword:
+        Fn::FindInMap: [Function, vSRX, PasswordLength]
+      RandomPasswordSpecialCharacters: 'False'
+      Region: {Ref: 'AWS::Region'}
+      ServiceToken:
+        Fn::GetAtt: [SolutionHelper, Arn]
+    Type: Custom::LoadLambda
+  CreateRsaKey:
+    Properties:
+      CreateSshKey:
+        Fn::Join:
+        - ''
+        - - '{ ''Bucket'' : '''
+          - {Ref: VPNConfigS3Bucket}
+          - ''', '
+          - '''SSEKMSKeyId'' : ''arn:aws:kms:'
+          - {Ref: 'AWS::Region'}
+          - ':'
+          - {Ref: 'AWS::AccountId'}
+          - :key/
+          - {Ref: KMSKey}
+          - ''', '
+          - '''PrivateKey'' : '''
+          - {Ref: S3Prefix}
+          - Fn::FindInMap: [Function, vSRX, PrivateKey]
+          - ''', '
+          - '''PublicKey'' : '''
+          - {Ref: S3Prefix}
+          - Fn::FindInMap: [Function, vSRX, PublicKey]
+          - ''' '
+          - '}'
+      Region: {Ref: 'AWS::Region'}
+      ServiceToken:
+        Fn::GetAtt: [SolutionHelper, Arn]
+    Type: Custom::LoadLambda
+  CreateUniqueID:
+    Properties:
+      CreateUniqueID: 'true'
+      Region: {Ref: 'AWS::Region'}
+      ServiceToken:
+        Fn::GetAtt: [SolutionHelper, Arn]
+    Type: Custom::LoadLambda
+  IGW:
+    Properties:
+      Tags:
+      - {Key: Name, Value: Transit VPC IGW}
+    Type: AWS::EC2::InternetGateway
+  IGWToInternet:
+    Properties:
+      InternetGatewayId: {Ref: IGW}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::VPCGatewayAttachment
+  JuniperConfigFunct:
+    Properties:
+      Description:
+        Fn::FindInMap: [Function, Configurator, Description]
+      FunctionName:
+        Fn::Join:
+        - ''
+        - - {Ref: 'AWS::StackName'}
+          - '-'
+          - Fn::FindInMap: [Function, Configurator, Name]
+      LambdaCode:
+        Fn::FindInMap: [Function, Configurator, CodeLocation]
+      LambdaCodeRegion: {Ref: LambdaRegion}
+      MemorySize:
+        Fn::FindInMap: [Function, Configurator, MemorySize]
+      Region: {Ref: 'AWS::Region'}
+      Role:
+        Fn::GetAtt: [JuniperConfigFunctionRole, Arn]
+      Runtime:
+        Fn::FindInMap: [Function, Configurator, Runtime]
+      S3Event:
+        Fn::Join:
+        - ''
+        - - '{ ''Bucket'' : '''
+          - {Ref: VPNConfigS3Bucket}
+          - ''', '
+          - '''EventPattern'' : {'
+          - '''LambdaFunctionConfigurations'' : [ {'
+          - '''LambdaFunctionArn'': ''Replace_by_SolutionHelper'','
+          - '''Events'': [''s3:ObjectCreated:Put'' ],'
+          - '''Filter'': {'
+          - '''Key'': {'
+          - '''FilterRules'': [ {'
+          - '''Name'': ''prefix'','
+          - '''Value'': '''
+          - {Ref: S3Prefix}
+          - ''''
+          - '}, {'
+          - '''Name'': ''suffix'','
+          - '''Value'': ''.conf'''
+          - '} ] } }'
+          - '} ] }'
+          - '}'
+      ServiceToken:
+        Fn::GetAtt: [SolutionHelper, Arn]
+      StoreInS3KMS:
+        Fn::Join:
+        - ''
+        - - '[{ ''Bucket'' : '''
+          - {Ref: VPNConfigS3Bucket}
+          - ''', '
+          - '''Key'' : '''
+          - {Ref: S3Prefix}
+          - 'transit_vpc_config.txt'', '
+          - '''SSEKMSKeyId'' : ''arn:aws:kms:'
+          - {Ref: 'AWS::Region'}
+          - ':'
+          - {Ref: 'AWS::AccountId'}
+          - :key/
+          - {Ref: KMSKey}
+          - ''', '
+          - '''Body'': "{'
+          - '''UUID'':'''
+          - Fn::GetAtt: [CreateUniqueID, UUID]
+          - ''','
+          - '''SENDDATA'':'''
+          - {Ref: SendAnonymousData}
+          - ''','
+          - '''EIP1'':'''
+          - {Ref: vSRXEip12}
+          - ''','
+          - '''EIP2'':'''
+          - {Ref: vSRXEip22}
+          - ''','
+          - '''PIP1'':'''
+          - Fn::GetAtt: [VpcvSRX1, PrivateIp]
+          - ''','
+          - '''PIP2'':'''
+          - Fn::GetAtt: [VpcvSRX2, PrivateIp]
+          - ''','
+          - '''BGP_ASN'':'
+          - {Ref: BgpAsn}
+          - ','
+          - '''PREFERRED_PATH_TAG'':'''
+          - {Ref: PreferredPathTag}
+          - ''','
+          - '''HUB_TAG'':'''
+          - {Ref: SpokeTag}
+          - ''','
+          - '''HUB_TAG_VALUE'':'''
+          - {Ref: SpokeTagValue}
+          - ''','
+          - '''USER_NAME'':'''
+          - Fn::FindInMap: [Function, vSRX, UserName]
+          - ''','
+          - '''PRIVATE_KEY'':'''
+          - Fn::FindInMap: [Function, vSRX, PrivateKey]
+          - ''','
+          - '''PUBLIC_KEY'':'''
+          - Fn::GetAtt: [CreateRsaKey, PubKey]
+          - ''','
+          - '''PASSWORD'':'''
+          - Fn::GetAtt: [CreateRandomPassword, Password]
+          - ''','
+          - '''KMS_KEY'':''arn:aws:kms:'
+          - {Ref: 'AWS::Region'}
+          - ':'
+          - {Ref: 'AWS::AccountId'}
+          - :key/
+          - {Ref: KMSKey}
+          - ''''
+          - '}"'
+          - '}]'
+      Timeout:
+        Fn::FindInMap: [Function, Configurator, Timeout]
+      VpcConfig:
+        Fn::Join:
+        - ''
+        - - '{ ''SubnetIds'': ['
+          - ''''
+          - {Ref: VPCPubSub11}
+          - ''','
+          - ''''
+          - {Ref: VPCPubSub21}
+          - '''],'
+          - '''SecurityGroupIds'': ['
+          - ''''
+          - {Ref: JuniperConfigSecurityGroup}
+          - ''']'
+          - '}'
+    Type: Custom::LoadLambda
+  JuniperConfigFunctionRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal: {Service: lambda.amazonaws.com}
+        Version: '2012-10-17'
+      Path: /
+    Type: AWS::IAM::Role
+  JuniperConfigFunctionRolePolicy:
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:logs:'
+              - {Ref: 'AWS::Region'}
+              - ':'
+              - {Ref: 'AWS::AccountId'}
+              - :log-group:/aws/lambda/*
+        - Action: ['ec2:CreateNetworkInterface', 'ec2:DescribeNetworkInterfaces',
+            'ec2:DetachNetworkInterface', 'ec2:DeleteNetworkInterface']
+          Effect: Allow
+          Resource: '*'
+        - Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*',
+            'kms:DescribeKey']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:kms:'
+              - {Ref: 'AWS::Region'}
+              - ':'
+              - {Ref: 'AWS::AccountId'}
+              - :key/
+              - {Ref: KMSKey}
+        - Action: ['s3:PutObject', 's3:GetObject']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - {Ref: VPNConfigS3Bucket}
+              - /
+              - {Ref: S3Prefix}
+              - '*'
+        Version: '2012-10-17'
+      PolicyName: Juniper_Config_Permissions
+      Roles:
+      - {Ref: JuniperConfigFunctionRole}
+    Type: AWS::IAM::Policy
+  JuniperConfigSecurityGroup:
+    Properties:
+      GroupDescription: Transit VPC Automation Security Group Rules
+      SecurityGroupEgress:
+      - {CidrIp: 0.0.0.0/0, FromPort: '443', IpProtocol: '-1', ToPort: '443'}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::SecurityGroup
+  KMSKey:
+    Properties:
+      Description: TransitVPC CMK for S3 SSE-KMS
+      KeyPolicy:
+        Id: transit-vpc-1
+        Statement:
+        - Action: ['kms:*']
+          Effect: Allow
+          Principal:
+            AWS:
+            - Fn::Join:
+              - ''
+              - - 'arn:aws:iam::'
+                - {Ref: 'AWS::AccountId'}
+                - :root
+          Resource: '*'
+          Sid: Enable IAM User Permissions
+        - Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*',
+            'kms:DescribeKey']
+          Effect: Allow
+          Principal:
+            AWS:
+            - Fn::Join:
+              - ''
+              - - 'arn:aws:iam::'
+                - Fn::If:
+                  - AuthorizeAnotherAccount
+                  - {Ref: AccountId}
+                  - {Ref: 'AWS::AccountId'}
+                - :root
+            - Fn::GetAtt: [SolutionHelperRole, Arn]
+            - Fn::GetAtt: [JuniperConfigFunctionRole, Arn]
+            - Fn::GetAtt: [TransitVpcPollerRole, Arn]
+          Resource: '*'
+          Sid: Allow use of the key
+        Version: '2012-10-17'
+    Type: AWS::KMS::Key
+  PollerFunct:
+    DependsOn: JuniperConfigFunct
+    Properties:
+      CloudWatchEvent:
+        Fn::Join:
+        - ''
+        - - '{ ''RuleName'' : '''
+          - {Ref: 'AWS::StackName'}
+          - '-VGW-Poller-15min'', '
+          - '''ScheduleExpression'' : ''cron(*/15 * * * ? *)'','
+          - '''Description'': ''Transit VPC: Rule to trigger VGW-Poller every 15 minutes
+            to find VGWs that need to be attached to the transit VPC.'' }'
+      Deliminator:
+        Fn::FindInMap: [Function, FindReplace, Deliminator]
+      Description:
+        Fn::FindInMap: [Function, Poller, Description]
+      FindReplace:
+        Fn::Join:
+        - ''
+        - - Fn::FindInMap: [Function, FindReplace, S3BucketID]
+          - Fn::FindInMap: [Function, FindReplace, Deliminator]
+          - {Ref: VPNConfigS3Bucket}
+          - ','
+          - Fn::FindInMap: [Function, FindReplace, S3PrefixID]
+          - Fn::FindInMap: [Function, FindReplace, Deliminator]
+          - {Ref: S3Prefix}
+      FunctionName:
+        Fn::Join:
+        - ''
+        - - {Ref: 'AWS::StackName'}
+          - '-'
+          - Fn::FindInMap: [Function, Poller, Name]
+      LambdaCode:
+        Fn::FindInMap: [Function, Poller, CodeLocation]
+      LambdaCodeRegion: {Ref: LambdaRegion}
+      MemorySize:
+        Fn::FindInMap: [Function, Poller, MemorySize]
+      Region: {Ref: 'AWS::Region'}
+      Role:
+        Fn::GetAtt: [TransitVpcPollerRole, Arn]
+      Runtime:
+        Fn::FindInMap: [Function, Poller, Runtime]
+      ServiceToken:
+        Fn::GetAtt: [SolutionHelper, Arn]
+      Timeout:
+        Fn::FindInMap: [Function, Poller, Timeout]
+    Type: Custom::LoadLambda
+  S3Endpoint:
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action: ['s3:*']
+          Effect: Allow
+          Principal: '*'
+          Resource: ['*']
+        Version: '2012-10-17'
+      RouteTableIds:
+      - {Ref: VPCRouteTable}
+      ServiceName:
+        Fn::Join:
+        - ''
+        - - com.amazonaws.
+          - {Ref: 'AWS::Region'}
+          - .s3
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::VPCEndpoint
+  SSHtoVSRX:
+    Properties:
+      DestinationSecurityGroupId:
+        Fn::GetAtt: [VSRXSecurityGroup, GroupId]
+      FromPort: '22'
+      GroupId:
+        Fn::GetAtt: [JuniperConfigSecurityGroup, GroupId]
+      IpProtocol: tcp
+      ToPort: '22'
+    Type: AWS::EC2::SecurityGroupEgress
+  SendingData:
+    Condition: SendData
+    Properties:
+      SendAnonymousData:
+        Fn::Join:
+        - ''
+        - - '{ ''Solution'' : '''
+          - SO0001
+          - ''', '
+          - '''UUID'' : '''
+          - Fn::GetAtt: [CreateUniqueID, UUID]
+          - ''', '
+          - '''Data'': {'
+          - '''VSRXType'': '''
+          - {Ref: VSRXType}
+          - ''','
+          - '''LicenseModel'': '''
+          - {Ref: LicenseModel}
+          - ''''
+          - '}'
+          - '}'
+      ServiceToken:
+        Fn::GetAtt: [SolutionHelper, Arn]
+    Type: Custom::LoadLambda
+  SolutionHelper:
+    DependsOn: SolutionHelperRolePolicy
+    Properties:
+      Code:
+        S3Bucket:
+          Fn::Join:
+          - ''
+          - - solutions-
+            - {Ref: 'AWS::Region'}
+        S3Key: library/solution-helper/v3/solution-helper.zip
+      Description: 'Transit VPC: CloudFormation custom resource function invoked during
+        transit VPC CloudFormation create, update, and delete stack operations.'
+      Handler: solution-helper.lambda_handler
+      Role:
+        Fn::GetAtt: [SolutionHelperRole, Arn]
+      Runtime: python2.7
+      Timeout: '60'
+    Type: AWS::Lambda::Function
+  SolutionHelperRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal: {Service: lambda.amazonaws.com}
+        Version: '2012-10-17'
+      Path: /
+    Type: AWS::IAM::Role
+  SolutionHelperRolePolicy:
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:logs:'
+              - {Ref: 'AWS::Region'}
+              - ':'
+              - {Ref: 'AWS::AccountId'}
+              - :log-group:/aws/lambda/*
+        - Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*',
+            'kms:DescribeKey']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:kms:'
+              - {Ref: 'AWS::Region'}
+              - ':'
+              - {Ref: 'AWS::AccountId'}
+              - :key/
+              - {Ref: KMSKey}
+        - Action: ['s3:PutBucketNotification']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - {Ref: VPNConfigS3Bucket}
+        - Action: ['lambda:*', 'events:*', 'ec2:DescribeSecurityGroups', 'ec2:DescribeSubnets',
+            'ec2:DescribeVpcs']
+          Effect: Allow
+          Resource: '*'
+        - Action: ['iam:PassRole']
+          Effect: Allow
+          Resource:
+          - Fn::GetAtt: [JuniperConfigFunctionRole, Arn]
+          - Fn::GetAtt: [TransitVpcPollerRole, Arn]
+        - Action: ['s3:PutObject', 's3:GetObject', 's3:DeleteObject']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - {Ref: VPNConfigS3Bucket}
+              - /
+              - {Ref: S3Prefix}
+              - '*'
+        - Action: ['s3:GetObject']
+          Effect: Allow
+          Resource: arn:aws:s3:::solutions-reference/*
+        Version: '2012-10-17'
+      PolicyName: Solution_Helper_Permissions
+      Roles:
+      - {Ref: SolutionHelperRole}
+    Type: AWS::IAM::Policy
+  TransitVPC:
+    Properties:
+      CidrBlock: {Ref: VpcCidr}
+      Tags:
+      - {Key: Name, Value: Transit VPC}
+    Type: AWS::EC2::VPC
+  TransitVpcPollerRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal: {Service: lambda.amazonaws.com}
+        Version: '2012-10-17'
+      Path: /
+    Type: AWS::IAM::Role
+  TransitVpcPollerRolePolicy:
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:logs:'
+              - {Ref: 'AWS::Region'}
+              - ':'
+              - {Ref: 'AWS::AccountId'}
+              - :log-group:/aws/lambda/*
+        - Action: ['ec2:Describe*', 'ec2:CreateTags', 'ec2:CreateCustomerGateway',
+            'ec2:DeleteCustomerGateway', 'ec2:CreateVpnConnection', 'ec2:DeleteVpnConnection']
+          Effect: Allow
+          Resource: '*'
+        - Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*',
+            'kms:DescribeKey']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:kms:'
+              - {Ref: 'AWS::Region'}
+              - ':'
+              - {Ref: 'AWS::AccountId'}
+              - :key/
+              - {Ref: KMSKey}
+        - Action: ['s3:PutObject', 's3:PutObjectAcl', 's3:GetObject']
+          Effect: Allow
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - {Ref: VPNConfigS3Bucket}
+              - /
+              - {Ref: S3Prefix}
+              - '*'
+        Version: '2012-10-17'
+      PolicyName: Transit_VPC_Poller_Function_Permissions
+      Roles:
+      - {Ref: TransitVpcPollerRole}
+    Type: AWS::IAM::Policy
+  VPCPubSub11:
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - '0'
+        - {'Fn::GetAZs': ''}
+      CidrBlock: {Ref: PubSubnet11}
+      Tags:
+      - {Key: Network, Value: Public}
+      - {Key: Name, Value: Transit VPC Subnet1}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::Subnet
+  VPCPubSub12:
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - '0'
+        - {'Fn::GetAZs': ''}
+      CidrBlock: {Ref: PubSubnet12}
+      Tags:
+      - {Key: Network, Value: Public}
+      - {Key: Name, Value: Transit VPC Subnet1}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::Subnet
+  VPCPubSub21:
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - '1'
+        - {'Fn::GetAZs': ''}
+      CidrBlock: {Ref: PubSubnet21}
+      Tags:
+      - {Key: Network, Value: Public}
+      - {Key: Name, Value: Transit VPC Subnet2}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::Subnet
+  VPCPubSub22:
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - '1'
+        - {'Fn::GetAZs': ''}
+      CidrBlock: {Ref: PubSubnet22}
+      Tags:
+      - {Key: Network, Value: Public}
+      - {Key: Name, Value: Transit VPC Subnet1}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::Subnet
+  VPCPubSubnetRouteTableAssociation1:
+    Properties:
+      RouteTableId: {Ref: VPCRouteTable}
+      SubnetId: {Ref: VPCPubSub11}
+    Type: AWS::EC2::SubnetRouteTableAssociation
+  VPCPubSubnetRouteTableAssociation2:
+    Properties:
+      RouteTableId: {Ref: VPCRouteTable}
+      SubnetId: {Ref: VPCPubSub12}
+    Type: AWS::EC2::SubnetRouteTableAssociation
+  VPCPubSubnetRouteTableAssociation3:
+    Properties:
+      RouteTableId: {Ref: VPCRouteTable}
+      SubnetId: {Ref: VPCPubSub21}
+    Type: AWS::EC2::SubnetRouteTableAssociation
+  VPCPubSubnetRouteTableAssociation4:
+    Properties:
+      RouteTableId: {Ref: VPCRouteTable}
+      SubnetId: {Ref: VPCPubSub22}
+    Type: AWS::EC2::SubnetRouteTableAssociation
+  VPCPublicRoute:
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: {Ref: IGW}
+      RouteTableId: {Ref: VPCRouteTable}
+    Type: AWS::EC2::Route
+  VPCRouteTable:
+    Properties:
+      Tags:
+      - {Key: Network, Value: Public}
+      - {Key: Name, Value: Transit VPC}
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::RouteTable
+  VPNConfigBucketPolicy:
+    Properties:
+      Bucket: {Ref: VPNConfigS3Bucket}
+      PolicyDocument:
+        Statement:
+        - Action: s3:PutObject
+          Condition:
+            StringNotEquals: {'s3:x-amz-server-side-encryption': 'aws:kms'}
+          Effect: Deny
+          Principal: '*'
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - {Ref: VPNConfigS3Bucket}
+              - /
+              - {Ref: S3Prefix}
+              - '*'
+          Sid: DenyUnEncryptedObjectUploads
+        - Action: ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl']
+          Effect: Allow
+          Principal:
+            AWS:
+            - Fn::Join:
+              - ''
+              - - 'arn:aws:iam::'
+                - Fn::If:
+                  - AuthorizeAnotherAccount
+                  - {Ref: AccountId}
+                  - {Ref: 'AWS::AccountId'}
+                - :root
+          Resource:
+            Fn::Join:
+            - ''
+            - - 'arn:aws:s3:::'
+              - {Ref: VPNConfigS3Bucket}
+              - /
+              - {Ref: S3Prefix}
+              - '*'
+    Type: AWS::S3::BucketPolicy
+  VPNConfigS3Bucket: {Type: 'AWS::S3::Bucket'}
+  VSRX1RecoveryAlarm:
+    Properties:
+      AlarmActions:
+      - Fn::Join:
+        - ''
+        - - 'arn:aws:automate:'
+          - {Ref: 'AWS::Region'}
+          - :ec2:recover
+      AlarmDescription: Trigger a recovery when VSRX1 instance status check fails
+        for 15 consecutive minutes.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: InstanceId
+        Value: {Ref: VpcvSRX1}
+      EvaluationPeriods: '35'
+      MetricName: StatusCheckFailed_System
+      Namespace: AWS/EC2
+      Period: '60'
+      Statistic: Minimum
+      Threshold: '0'
+    Type: AWS::CloudWatch::Alarm
+  VSRX2RecoveryAlarm:
+    Properties:
+      AlarmActions:
+      - Fn::Join:
+        - ''
+        - - 'arn:aws:automate:'
+          - {Ref: 'AWS::Region'}
+          - :ec2:recover
+      AlarmDescription: Trigger a recovery when VSRX2 instance status check fails
+        for 15 consecutive minutes.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: InstanceId
+        Value: {Ref: VpcvSRX2}
+      EvaluationPeriods: '35'
+      MetricName: StatusCheckFailed_System
+      Namespace: AWS/EC2
+      Period: '60'
+      Statistic: Minimum
+      Threshold: '0'
+    Type: AWS::CloudWatch::Alarm
+  VSRXSecurityGroup:
+    Properties:
+      GroupDescription: VSRX Security Group Rules
+      SecurityGroupEgress:
+      - {CidrIp: 0.0.0.0/0, FromPort: '0', IpProtocol: '-1', ToPort: '65535'}
+      SecurityGroupIngress:
+      - FromPort: '22'
+        IpProtocol: '-1'
+        SourceSecurityGroupId: {Ref: JuniperConfigSecurityGroup}
+        ToPort: '22'
+      VpcId: {Ref: TransitVPC}
+    Type: AWS::EC2::SecurityGroup
+  VpcvSRX1:
+    DependsOn: IGW
+    Metadata: {Comment1: Launch Juniper VSRX1}
+    Properties:
+      DisableApiTermination:
+        Fn::If: [EnableTerm, true, false]
+      ImageId:
+        Fn::FindInMap:
+        - JunipervSRXAMI
+        - {Ref: 'AWS::Region'}
+        - {Ref: LicenseModel}
+      InstanceType:
+        Fn::FindInMap:
+        - vSRXInstance
+        - {Ref: VSRXType}
+        - Type
+      KeyName: {Ref: KeyName}
+      NetworkInterfaces:
+      - DeviceIndex: '0'
+        NetworkInterfaceId: {Ref: vSRXInterface11}
+      - DeviceIndex: '1'
+        NetworkInterfaceId: {Ref: vSRXInterface12}
+      Tags:
+      - {Key: Name, Value: Transit VPC VSRX1}
+    Type: AWS::EC2::Instance
+  VpcvSRX2:
+    DependsOn: IGW
+    Metadata: {Comment1: Launch Juniper VSRX2}
+    Properties:
+      DisableApiTermination:
+        Fn::If: [EnableTerm, true, false]
+      ImageId:
+        Fn::FindInMap:
+        - JunipervSRXAMI
+        - {Ref: 'AWS::Region'}
+        - {Ref: LicenseModel}
+      InstanceType:
+        Fn::FindInMap:
+        - vSRXInstance
+        - {Ref: VSRXType}
+        - Type
+      KeyName: {Ref: KeyName}
+      NetworkInterfaces:
+      - DeviceIndex: '0'
+        NetworkInterfaceId: {Ref: vSRXInterface21}
+      - DeviceIndex: '1'
+        NetworkInterfaceId: {Ref: vSRXInterface22}
+      Tags:
+      - {Key: Name, Value: Transit VPC VSRX2}
+    Type: AWS::EC2::Instance
+  vSRXEip11:
+    Properties: {Domain: vpc}
+    Type: AWS::EC2::EIP
+  vSRXEip12:
+    Properties: {Domain: vpc}
+    Type: AWS::EC2::EIP
+  vSRXEip21:
+    Properties: {Domain: vpc}
+    Type: AWS::EC2::EIP
+  vSRXEip22:
+    Properties: {Domain: vpc}
+    Type: AWS::EC2::EIP
+  vSRXInterface11:
+    Properties:
+      Description: vSRXRevenueInterface1
+      GroupSet:
+      - {Ref: VSRXSecurityGroup}
+      SourceDestCheck: 'false'
+      SubnetId: {Ref: VPCPubSub11}
+    Type: AWS::EC2::NetworkInterface
+  vSRXInterface12:
+    Properties:
+      Description: vSRXRevenueInterface1
+      GroupSet:
+      - {Ref: VSRXSecurityGroup}
+      SourceDestCheck: 'false'
+      SubnetId: {Ref: VPCPubSub12}
+    Type: AWS::EC2::NetworkInterface
+  vSRXInterface21:
+    Properties:
+      Description: vSRXRevenueInterface1
+      GroupSet:
+      - {Ref: VSRXSecurityGroup}
+      SourceDestCheck: 'false'
+      SubnetId: {Ref: VPCPubSub21}
+    Type: AWS::EC2::NetworkInterface
+  vSRXInterface22:
+    Properties:
+      Description: vSRXRevenueInterface1
+      GroupSet:
+      - {Ref: VSRXSecurityGroup}
+      SourceDestCheck: 'false'
+      SubnetId: {Ref: VPCPubSub22}
+    Type: AWS::EC2::NetworkInterface
+
