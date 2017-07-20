@@ -89,8 +89,8 @@ Parameters:
   LambdaRegion:
     Description: Choose a region to where Lambda code runs.
     Type: String
-    Default: us-east-1
-    #Default: us-east-2
+    #Default: us-east-1
+    Default: us-east-2
     AllowedValues:
     - us-east-1
     - us-east-2
@@ -185,7 +185,8 @@ Metadata:
 Mappings:
   Function:
     Configurator:
-      CodeLocation: juniper-transit-vpc/transit-vpc-push-juniper-config.zip
+      #CodeLocation: juniper-transit-vpc/transit-vpc-push-juniper-config.zip
+      CodeLocation: ckim-vsrx-lambdas/transit-vpc-push-juniper-config.zip
       Name: juniper-configurator
       Description: 'Transit VPC: This function is invoked when a generic VPN configuration
         is placed in an S3 bucket - it converts the generic information into Junos
@@ -194,7 +195,8 @@ Mappings:
       Timeout: '300'
       MemorySize: '128'
     Poller:
-      CodeLocation: juniper-transit-vpc/transit-vpc-poller.py
+      #CodeLocation: juniper-transit-vpc/transit-vpc-poller.py
+      CodeLocation: ckim-vsrx-lambdas/transit-vpc-poller.py
       Name: vgw-poller
       Description: 'Transit VPC: Poller function responsible for identifying specifically
         tagged VGWs and creating VPN connections to transit VPC.'
@@ -521,49 +523,41 @@ Resources:
   vSRXInterface11:
     Type: AWS::EC2::NetworkInterface
     Properties:
-      Description: vSRXRevenueInterface1
-      SourceDestCheck: 'false'
+      Description: vSRX1 fxp0
+      SourceDestCheck: false
       GroupSet:
-      - Ref: VSRXSecurityGroup
-      SubnetId:
-        Ref: VPCPubSub11
+      - !Ref VSRXSecurityGroup
+      SubnetId: !Ref VPCPubSub11
   vSRXInterface12:
     Type: AWS::EC2::NetworkInterface
     Properties:
-      Description: vSRXRevenueInterface1
-      SourceDestCheck: 'false'
+      Description: vSRX1 ge-0/0/0
+      SourceDestCheck: false
       GroupSet:
-      - Ref: VSRXSecurityGroup
-      SubnetId:
-        Ref: VPCPubSub12
+      - !Ref VSRXSecurityGroup
+      SubnetId: !Ref VPCPubSub12
   vSRXInterface21:
     Type: AWS::EC2::NetworkInterface
     Properties:
-      Description: vSRXRevenueInterface1
-      SourceDestCheck: 'false'
+      Description: vSRX2 fxp0
+      SourceDestCheck: false
       GroupSet:
-      - Ref: VSRXSecurityGroup
-      SubnetId:
-        Ref: VPCPubSub21
+      - !Ref VSRXSecurityGroup
+      SubnetId: !Ref VPCPubSub21
   vSRXInterface22:
     Type: AWS::EC2::NetworkInterface
     Properties:
-      Description: vSRXRevenueInterface1
+      Description: vSRX2 ge-0/0/0
       SourceDestCheck: 'false'
       GroupSet:
-      - Ref: VSRXSecurityGroup
-      SubnetId:
-        Ref: VPCPubSub22
+      - !Ref VSRXSecurityGroup
+      SubnetId: !Ref VPCPubSub22
   VpcvSRX1:
     Type: AWS::EC2::Instance
     Metadata:
       Comment1: Launch Juniper VSRX1
     Properties:
-      InstanceType:
-        Fn::FindInMap:
-        - vSRXInstance
-        - Ref: VSRXType
-        - Type
+      InstanceType: !FindInMap [ vSRXInstance, !Ref VSRXType, Type ]
       KeyName:
         Ref: KeyName
       DisableApiTermination:
@@ -571,18 +565,12 @@ Resources:
         - EnableTerm
         - true
         - false
-      ImageId:
-        Fn::FindInMap:
-        - JunipervSRXAMI
-        - Ref: AWS::Region
-        - Ref: LicenseModel
+      ImageId: !FindInMap [ JunipervSRXAMI, !Ref "AWS::Region", !Ref LicenseModel ]
       NetworkInterfaces:
-      - NetworkInterfaceId:
-          Ref: vSRXInterface11
-        DeviceIndex: '0'
-      - NetworkInterfaceId:
-          Ref: vSRXInterface12
-        DeviceIndex: '1'
+      - NetworkInterfaceId: !Ref vSRXInterface11
+        DeviceIndex: 0
+      - NetworkInterfaceId: !Ref vSRXInterface12
+        DeviceIndex: 1
       Tags:
       - Key: Name
         Value: Transit VPC VSRX1
@@ -592,11 +580,7 @@ Resources:
     Metadata:
       Comment1: Launch Juniper VSRX2
     Properties:
-      InstanceType:
-        Fn::FindInMap:
-        - vSRXInstance
-        - Ref: VSRXType
-        - Type
+      InstanceType: !FindInMap [ vSRXInstance, !Ref VSRXType, Type ]
       KeyName:
         Ref: KeyName
       DisableApiTermination:
@@ -604,18 +588,12 @@ Resources:
         - EnableTerm
         - true
         - false
-      ImageId:
-        Fn::FindInMap:
-        - JunipervSRXAMI
-        - Ref: AWS::Region
-        - Ref: LicenseModel
+      ImageId: !FindInMap [ JunipervSRXAMI, !Ref "AWS::Region", !Ref LicenseModel ]
       NetworkInterfaces:
-      - NetworkInterfaceId:
-          Ref: vSRXInterface21
-        DeviceIndex: '0'
-      - NetworkInterfaceId:
-          Ref: vSRXInterface22
-        DeviceIndex: '1'
+      - NetworkInterfaceId: !Ref vSRXInterface21
+        DeviceIndex: 0
+      - NetworkInterfaceId: !Ref vSRXInterface22
+        DeviceIndex: 1
       Tags:
       - Key: Name
         Value: Transit VPC VSRX2
@@ -699,8 +677,7 @@ Resources:
     Type: Custom::LoadLambda
     Properties:
       ServiceToken: !GetAtt SolutionHelper.Arn
-      Region:
-        Ref: AWS::Region
+      Region: !Ref AWS::Region
       CreateSshKey:
         Fn::Join:
         - ''
@@ -841,77 +818,57 @@ Resources:
       StoreInS3KMS:
         Fn::Join:
         - ''
-        - - '[{ ''Bucket'' : '''
+        - - "[{ 'Bucket' : '"
           - Ref: VPNConfigS3Bucket
-          - ''', '
-          - '''Key'' : '''
+          - "', 'Key' : '"
           - Ref: S3Prefix
-          - 'transit_vpc_config.txt'', '
-          - '''SSEKMSKeyId'' : ''arn:aws:kms:'
+          - "transit_vpc_config.txt', 'SSEKMSKeyId' : 'arn:aws:kms:"
           - Ref: AWS::Region
-          - ':'
+          - ":"
           - Ref: AWS::AccountId
           - :key/
           - Ref: KMSKey
-          - ''', '
-          - '''Body'': "{'
-          - '''UUID'':'''
+          - "', 'Body': \"{'UUID': '"
           - !GetAtt CreateUniqueID.UUID
-          - ''','
-          - '''SENDDATA'':'''
+          - "', 'SENDDATA': '"
           - Ref: SendAnonymousData
-          - ''','
-          - '''EIP1'':'''
+          - "', 'EIP1': '"
           - Ref: vSRXEip12
-          - ''','
-          - '''EIP2'':'''
+          - "','EIP2': '"
           - Ref: vSRXEip22
-          - ''','
-          - '''PIP1'':'''
+          - "', 'PIP1': '"
           - !GetAtt VpcvSRX1.PrivateIp
-          - ''','
-          - '''PIP2'':'''
+          - "', 'PIP2': '"
           - !GetAtt VpcvSRX2.PrivateIp
-          - ''','
-          - '''BGP_ASN'':'
+          - "', 'BGP_ASN': "
           - Ref: BgpAsn
-          - ','
-          - '''PREFERRED_PATH_TAG'':'''
+          - ", 'PREFERRED_PATH_TAG': '"
           - Ref: PreferredPathTag
-          - ''','
-          - '''HUB_TAG'':'''
+          - "', 'HUB_TAG': '"
           - Ref: SpokeTag
-          - ''','
-          - '''HUB_TAG_VALUE'':'''
+          - "', 'HUB_TAG_VALUE': '"
           - Ref: SpokeTagValue
-          - ''','
-          - '''USER_NAME'':'''
+          - "', 'USER_NAME': '"
           - Fn::FindInMap:
             - Function
             - vSRX
             - UserName
-          - ''','
-          - '''PRIVATE_KEY'':'''
+          - "', 'PRIVATE_KEY': '"
           - Fn::FindInMap:
             - Function
             - vSRX
             - PrivateKey
-          - ''','
-          - '''PUBLIC_KEY'':'''
+          - "','PUBLIC_KEY': '"
           - !GetAtt CreateRsaKey.PubKey
-          - ''','
-          - '''PASSWORD'':'''
+          - "', 'PASSWORD': '"
           - !GetAtt CreateRandomPassword.Password
-          - ''','
-          - '''KMS_KEY'':''arn:aws:kms:'
+          - "', 'KMS_KEY': 'arn:aws:kms:"
           - Ref: AWS::Region
           - ':'
           - Ref: AWS::AccountId
           - :key/
           - Ref: KMSKey
-          - ''''
-          - '}"'
-          - '}]'
+          - "'}\" }]"
   TransitVpcPollerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1037,18 +994,18 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: VSRX Security Group Rules
-      VpcId:
-        Ref: TransitVPC
+      VpcId: !Ref TransitVPC
       SecurityGroupIngress:
-      - IpProtocol: '-1'
-        FromPort: '22'
-        ToPort: '22'
-        SourceSecurityGroupId:
-          Ref: JuniperConfigSecurityGroup
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+        #SourceSecurityGroupId:
+        #  Ref: JuniperConfigSecurityGroup
       SecurityGroupEgress:
       - IpProtocol: '-1'
-        FromPort: '0'
-        ToPort: '65535'
+        FromPort: 0
+        ToPort: 65535
         CidrIp: 0.0.0.0/0
   JuniperConfigSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -1111,7 +1068,7 @@ Resources:
       ServiceToken: !GetAtt SolutionHelper.Arn
       Region:
         Ref: AWS::Region
-      CreateUniqueID: 'true'
+      CreateUniqueID: true
   SendingData:
     Type: Custom::LoadLambda
     Condition: SendData
